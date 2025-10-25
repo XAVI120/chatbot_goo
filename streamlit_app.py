@@ -73,7 +73,7 @@ if not openai_api_key:
 # -----------------------------
 # Client
 # -----------------------------
-client = OpenAI()
+client = OpenAI(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)
 
 # -----------------------------
 # Helpers
