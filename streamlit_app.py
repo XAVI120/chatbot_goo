@@ -9,7 +9,7 @@ from openai import OpenAI
 # UI — Header & Help
 # -----------------------------
 st.set_page_config(page_title="💬 Chatbot (OpenAI)", page_icon="💬", layout="centered")
-st.title("💬 Chatbot")
+st.title("goooooooooooooooooooooooooo Chatbot")
 st.write(
     """
     Minimal yet robust Streamlit chat app using the OpenAI API with streaming, configurable parameters,
@@ -73,7 +73,7 @@ if not openai_api_key:
 # -----------------------------
 # Client
 # -----------------------------
-client = OpenAI(api_key=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)
+client = OpenAI()
 
 # -----------------------------
 # Helpers
