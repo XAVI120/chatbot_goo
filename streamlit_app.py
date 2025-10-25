@@ -79,7 +79,7 @@ if not openai_api_key:
 # -----------------------------
 # Client
 # -----------------------------
-client = OpenAI(api_key="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")
+client = OpenAI(api_key=openai_api_key)
 
 # -----------------------------
 # Helpers
@@ -106,9 +106,13 @@ def _as_openai_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def token_kwarg(model_name: str, max_tokens_val: int) -> Dict[str, Any]:
-    """Return the correct max-token kwarg for the chosen model family."""
+    """Return the correct max-token kwarg for Chat Completions models.
+    Responses API is handled separately because different SDK versions
+    may expect `max_output_tokens` vs `max_completion_tokens`.
+    """
     if model_name.startswith(("gpt-4o", "gpt-5")):
-        return {"max_completion_tokens": int(max_tokens_val)}
+        # Not used for Responses API; kept for clarity.
+        return {}
     return {"max_tokens": int(max_tokens_val)}
 
 # -----------------------------
@@ -156,7 +160,11 @@ if prompt := st.chat_input("Ask me anything…"):
                 # Recommended path: Responses API streaming (generator adapter)
                 # NOTE: The OpenAI SDK yields server-sent events; we adapt to a text generator for Streamlit.
                 def response_text_stream() -> Generator[str, None, None]:
-                    with client.responses.stream(
+                    # Create a streaming context with defensive compatibility for SDKs
+                # that expect either `max_completion_tokens` or `max_output_tokens`.
+                ctx = None
+                try:
+                    ctx = client.responses.stream(
                         model=model,
                         input=[
                             {"role": "system", "content": SYSTEM_PROMPT},
@@ -166,7 +174,22 @@ if prompt := st.chat_input("Ask me anything…"):
                         temperature=temperature,
                         max_completion_tokens=max_output_tokens,
                         seed=None if seed is None or seed < 0 else int(seed),
-                    ) as stream:
+                    )
+                except TypeError:
+                    # Fallback for SDKs using `max_output_tokens`
+                    ctx = client.responses.stream(
+                        model=model,
+                        input=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            *[{"role": m["role"], "content": m["content"]}
+                              for m in st.session_state.messages if m["role"] != "system"]
+                        ],
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        seed=None if seed is None or seed < 0 else int(seed),
+                    )
+
+                with ctx as stream:
                         # Iterate over incremental text deltas if available
                         for event in stream:
                             # Conservative parse: prefer generic text extractor when available
