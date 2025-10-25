@@ -1,248 +1,139 @@
-# app.py
 import os
-from typing import Generator, List, Dict, Any
-
+import json
+import time
 import streamlit as st
 from openai import OpenAI
+from typing import Generator, List, Dict
 
-# -----------------------------
-# UI — Header & Help
-# -----------------------------
-st.set_page_config(page_title="💬 Chatbot (OpenAI)", page_icon="💬", layout="centered")
-st.title("💬 Chatbot")
-st.write(
-    """
-    Minimal yet robust Streamlit chat app using the OpenAI API with streaming, configurable parameters,
-    and better session handling. Provide an API key in the sidebar to start.
-    """
+# ----------------------
+# App config & helpers
+# ----------------------
+st.set_page_config(page_title="💬 OpenAI Chatbot", page_icon="💬", layout="centered")
+
+st.title("💬 Chatbot (OpenAI API, streaming)")
+st.caption(
+    "A minimal but production-friendly Streamlit chat app using OpenAI's **Responses API** with streaming,"
+    " model selector, temperature control, error handling, and chat persistence."
 )
 
-# -----------------------------
-# Sidebar — Config & Secrets
-# -----------------------------
+# Sidebar controls
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    # Prefer Streamlit secrets when available
-    default_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
-    openai_api_key = st.text_input("OpenAI API Key", value=default_key, type="password")
-
-    # Model selection
+    # Prefer secrets/env var over text input to avoid exposing the key in reruns/history.
+    default_api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", ""))
+    api_key = st.text_input("OpenAI API Key", type="password", value=default_api_key)
     model = st.selectbox(
         "Model",
-        options=[
-            "gpt-3.5-turbo",  # legacy compatible (Chat Completions)
-            "gpt-4-turbo",    # Chat Completions
-            "gpt-4o",         # typically via Responses API
-            "gpt-4o-mini",    # typically via Responses API
-            "gpt-5",          # typically via Responses API
+        # Keep options concise; users can type a custom name as well.
+        [
+            "gpt-5",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4.1-mini",
+            "gpt-4o-mini",
         ],
-        index=0,
-        help="If you pick 4o/5-family, switch the Backend to 'Responses (recommended)'."
+        index=2,
+        help="Choose a chat-capable model. See OpenAI docs for the latest list."
     )
-
-    backend = st.radio(
-        "API Backend",
-        options=["Chat Completions (legacy)", "Responses (recommended)"],
-        index=0,
-        help=(
-            "OpenAI recommends the Responses API for new projects. "
-            "Chat Completions is kept here for compatibility."
-        ),
-    )
-
-    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
-
-    # NOTE:
-    # - Chat Completions uses `max_tokens`
-    # - Responses uses `max_completion_tokens` or (older SDKs) `max_output_tokens`
-    max_output_tokens = st.slider("Max tokens (per response)", 64, 4096, 512, 64)
-
-    seed = st.number_input("Seed (optional, -1 for none)", value=-1, step=1)
+    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1,
+                            help="Higher values = more creative, lower = more deterministic")
+    max_output_tokens = st.slider("Max output tokens", 128, 8192, 1024, 64)
 
     st.divider()
-    st.caption("Memory & History")
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    keep_last_n = st.number_input("Keep last N turns in context", value=12, min_value=2, step=1)
-    if st.button("🧹 Clear chat history"):
-        st.session_state.messages = []
-        st.success("History cleared.")
+    system_prompt = st.text_area(
+        "System prompt (optional)",
+        value="You are a helpful, concise assistant.",
+        help="Prepends a system message to steer the assistant's behavior.",
+        height=100,
+    )
 
-# Guard: require API key
-if not openai_api_key:
-    st.info("Add your OpenAI API key in the sidebar to continue.", icon="🗝️")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        clear_btn = st.button("🧹 Clear chat", use_container_width=True)
+    with col_b:
+        export_btn = st.button("💾 Export chat", use_container_width=True)
+
+# ----------------------
+# Session state
+# ----------------------
+if "messages" not in st.session_state:
+    st.session_state.messages: List[Dict[str, str]] = []
+
+if clear_btn:
+    st.session_state.messages = []
+    st.rerun()
+
+if export_btn:
+    fn = f"chat_{int(time.time())}.json"
+    st.download_button(
+        label="Download chat JSON",
+        data=json.dumps(st.session_state.messages, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name=fn,
+        mime="application/json",
+        use_container_width=True,
+    )
+
+# ----------------------
+# Guardrail: API key
+# ----------------------
+if not api_key:
+    st.info("Add your OpenAI API key in the sidebar to start chatting.")
     st.stop()
 
-# Auto-switch backend if model requires Responses API (e.g., gpt-4o, gpt-5)
-family_needs_responses = model.startswith(("gpt-4o", "gpt-5"))
-if backend == "Chat Completions (legacy)" and family_needs_responses:
-    st.warning("Selected model requires the Responses API; switched backend automatically.", icon="⚠️")
-    backend = "Responses (recommended)"
+client = OpenAI(api_key=api_key)
 
-# -----------------------------
-# Client
-# -----------------------------
-client = OpenAI(api_key="")
+# ----------------------
+# UI: render history
+# ----------------------
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
 
-# -----------------------------
-# Helpers
-# -----------------------------
-SYSTEM_PROMPT = (
-    "You are a helpful, concise assistant. Answer clearly and cite sources when relevant."
-)
+# ----------------------
+# Streaming generator using Responses API
+# ----------------------
 
-def _truncate_history(history: List[Dict[str, str]], n_turns: int) -> List[Dict[str, str]]:
-    """Keep system + last N*2 messages (user+assistant per turn)."""
-    if not history:
-        return []
-    sys_msgs = [m for m in history if m.get("role") == "system"]
-    non_sys = [m for m in history if m.get("role") != "system"]
-    tail = non_sys[-2 * n_turns :]
-    return (sys_msgs[:1] + tail) if sys_msgs else tail
+def stream_response(messages: List[Dict[str, str]]) -> Generator[str, None, None]:
+    """Stream text deltas from the Responses API so Streamlit can render them live."""
+    # Convert messages to a single input per Responses API semantics.
+    # We concatenate role-tagged content; for long-term apps you may want to trim history.
+    items = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        items.append({"type": "message", "role": role, "content": msg["content"]})
 
-def _as_openai_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    return [{"role": h["role"], "content": h["content"]} for h in history]
+    try:
+        with client.responses.stream(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt} if system_prompt else None,
+                *[{"role": it["role"], "content": it["content"]} for it in items]
+            ],
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        ) as stream:
+            for event in stream:
+                # Text delta chunks
+                if event.type == "response.output_text.delta":
+                    yield event.delta
+                # You could handle tool/function events here if you add tool use.
+            # Ensure the final response is consumed to surface any server-side errors
+            _final = stream.get_final_response()
+    except Exception as e:
+        # Surface errors inline
+        yield f"\n\n**[Error]** {e}"
 
-def token_kwarg(model_name: str, max_tokens_val: int) -> Dict[str, Any]:
-    """
-    Return the correct max-token kwarg for Chat Completions models.
-    Responses API is handled separately because different SDK versions
-    may expect `max_output_tokens` vs `max_completion_tokens`.
-    """
-    if model_name.startswith(("gpt-4o", "gpt-5")):
-        # Not used for Responses API; kept for clarity.
-        return {}
-    return {"max_tokens": int(max_tokens_val)}
-
-# -----------------------------
-# UI — Existing messages
-# -----------------------------
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# -----------------------------
-# Chat input
-# -----------------------------
-if prompt := st.chat_input("Ask me anything…"):
-    # Add system prompt on first run
-    if not any(m.get("role") == "system" for m in st.session_state.messages):
-        st.session_state.messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-
-    # Store & render user message
+# ----------------------
+# Handle new user input
+# ----------------------
+prompt = st.chat_input("Type your message…")
+if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Truncate history to control context growth
-    st.session_state.messages = _truncate_history(st.session_state.messages, keep_last_n)
-
-    # -----------------------------
-    # Generate — two backends
-    # -----------------------------
     with st.chat_message("assistant"):
-        try:
-            if backend == "Chat Completions (legacy)":
-                # Chat Completions streaming
-                stream = client.chat.completions.create(
-                    model=model,
-                    messages=_as_openai_messages(st.session_state.messages),
-                    temperature=temperature,
-                    seed=None if seed is None or seed < 0 else int(seed),
-                    **token_kwarg(model, max_output_tokens),
-                    stream=True,
-                )
-                response_text = st.write_stream(stream)
+        # Stream tokens as they arrive
+        response_text = st.write_stream(stream_response(st.session_state.messages))
 
-            else:
-                # Responses API streaming, compatible across SDKs that differ on max token arg
-                def response_text_stream() -> Generator[str, None, None]:
-                    # First, try `max_completion_tokens`
-                    try:
-                        with client.responses.stream(
-                            model=model,
-                            input=[
-                                {"role": "system", "content": SYSTEM_PROMPT},
-                                *[
-                                    {"role": m["role"], "content": m["content"]}
-                                    for m in st.session_state.messages
-                                    if m["role"] != "system"
-                                ],
-                            ],
-                            temperature=temperature,
-                            max_completion_tokens=max_output_tokens,
-                            seed=None if seed is None or seed < 0 else int(seed),
-                        ) as stream:
-                            for event in stream:
-                                if hasattr(event, "data"):
-                                    delta = getattr(event, "delta", None) or getattr(event, "data", None)
-                                    if isinstance(delta, dict):
-                                        chunk = (
-                                            delta.get("delta")
-                                            or delta.get("text")
-                                            or delta.get("output_text")
-                                        )
-                                        if isinstance(chunk, str) and chunk:
-                                            yield chunk
-                            try:
-                                final = stream.get_final_response()
-                                if hasattr(final, "output_text") and final.output_text:
-                                    yield final.output_text
-                            except Exception:
-                                pass
-                        return
-                    except TypeError:
-                        # Fallback to `max_output_tokens` for older SDKs
-                        pass
-
-                    with client.responses.stream(
-                        model=model,
-                        input=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            *[
-                                {"role": m["role"], "content": m["content"]}
-                                for m in st.session_state.messages
-                                if m["role"] != "system"
-                            ],
-                        ],
-                        temperature=temperature,
-                        max_output_tokens=max_output_tokens,
-                        seed=None if seed is None or seed < 0 else int(seed),
-                    ) as stream:
-                        for event in stream:
-                            if hasattr(event, "data"):
-                                delta = getattr(event, "delta", None) or getattr(event, "data", None)
-                                if isinstance(delta, dict):
-                                    chunk = (
-                                        delta.get("delta")
-                                        or delta.get("text")
-                                        or delta.get("output_text")
-                                    )
-                                    if isinstance(chunk, str) and chunk:
-                                        yield chunk
-                        try:
-                            final = stream.get_final_response()
-                            if hasattr(final, "output_text") and final.output_text:
-                                yield final.output_text
-                        except Exception:
-                            pass
-
-                response_text = st.write_stream(response_text_stream())
-
-            # Store assistant message & collect quick feedback
-            st.session_state.messages.append({"role": "assistant", "content": response_text})
-            fb = st.feedback("thumbs", key=f"fb_{len(st.session_state.messages)}")
-            if fb is not None:
-                st.toast(f"Thanks for the feedback: {fb}")
-
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
-
-# -----------------------------
-# Footer
-# -----------------------------
-st.caption(
-    "Tip: Use the sidebar to switch between legacy Chat Completions and the newer Responses API, "
-    "adjust temperature/token limits, and trim the conversation length to control costs."
-)
+    st.session_state.messages.append({"role": "assistant", "content": response_text})
