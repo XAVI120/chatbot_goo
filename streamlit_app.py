@@ -1,56 +1,199 @@
+import os
+import time
+from typing import Iterable, Generator, List, Dict, Any
+
 import streamlit as st
 from openai import OpenAI
 
-# Show title and description.
+# -----------------------------
+# UI — Header & Help
+# -----------------------------
+st.set_page_config(page_title="💬 Chatbot (OpenAI)", page_icon="💬", layout="centered")
 st.title("💬 Chatbot")
 st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
+    """
+    Minimal yet robust Streamlit chat app using the OpenAI API with streaming, configurable parameters,
+    and better session handling. Provide an API key in the sidebar to start.
+    """
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# -----------------------------
+# Sidebar — Config & Secrets
+# -----------------------------
+with st.sidebar:
+    st.header("⚙️ Settings")
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+    # Prefer Streamlit secrets when available
+    default_key = st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else ""
+    openai_api_key = st.text_input("OpenAI API Key", value=default_key, type="password")
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
+    # Allow model selection (include a legacy-safe default)
+    # NOTE: "gpt-3.5-turbo" remains for backward compatibility; newer apps often prefer GPT-4.x/5.* models.
+    model = st.selectbox(
+        "Model",
+        options=[
+            "gpt-3.5-turbo",           # legacy compatible (Chat Completions)
+            "gpt-4-turbo",             # Chat Completions
+            "gpt-4o",                  # typically via Responses API; see toggle below
+            "gpt-4o-mini",             # typically via Responses API; see toggle below
+            "gpt-5",                   # typically via Responses API; see toggle below
+        ],
+        index=0,
+        help="If you pick 4o/5-family, switch the Backend to 'Responses (recommended)'."
+    )
+
+    backend = st.radio(
+        "API Backend",
+        options=["Chat Completions (legacy)", "Responses (recommended)"],
+        index=0,
+        help=(
+            "OpenAI recommends the Responses API for new projects. "
+            "Chat Completions is kept here for compatibility."
+        ),
+    )
+
+    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
+    max_output_tokens = st.slider("Max output tokens", 64, 4096, 512, 64)
+    seed = st.number_input("Seed (optional, -1 for none)", value=-1, step=1)
+
+    st.divider()
+    st.caption("Memory & History")
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    keep_last_n = st.number_input("Keep last N turns in context", value=12, min_value=2, step=1)
+    if st.button("🧹 Clear chat history"):
+        st.session_state.messages = []
+        st.success("History cleared.")
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# Guard: require API key
+if not openai_api_key:
+    st.info("Add your OpenAI API key in the sidebar to continue.", icon="🗝️")
+    st.stop()
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+# -----------------------------
+# Client
+# -----------------------------
+client = OpenAI(api_key="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")
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+# -----------------------------
+# Helpers
+# -----------------------------
+SYSTEM_PROMPT = (
+    "You are a helpful, concise assistant. Answer clearly and cite sources when relevant."
+)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+def _truncate_history(history: List[Dict[str, str]], n_turns: int) -> List[Dict[str, str]]:
+    """Keep system + last N*2 messages (user+assistant per turn)."""
+    if not history:
+        return []
+    # preserve the first system if present
+    sys_msgs = [m for m in history if m.get("role") == "system"]
+    non_sys = [m for m in history if m.get("role") != "system"]
+    # keep last 2*n messages (user/assistant pairs)
+    tail = non_sys[-2 * n_turns :]
+    return (sys_msgs[:1] + tail) if sys_msgs else tail
+
+
+def _as_openai_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    return [{"role": h["role"], "content": h["content"]} for h in history]
+
+
+# -----------------------------
+# UI — Existing messages
+# -----------------------------
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# -----------------------------
+# Chat input
+# -----------------------------
+if prompt := st.chat_input("Ask me anything…"):
+    # Append system message on first run
+    if not any(m.get("role") == "system" for m in st.session_state.messages):
+        st.session_state.messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+
+    # Store & render user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Truncate history to control context growth
+    st.session_state.messages = _truncate_history(st.session_state.messages, keep_last_n)
+
+    # -----------------------------
+    # Generate — two backends
+    # -----------------------------
+    with st.chat_message("assistant"):
+        try:
+            if backend == "Chat Completions (legacy)":
+                # This path uses the Chat Completions API with native streaming.
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=_as_openai_messages(st.session_state.messages),
+                    temperature=temperature,
+                    max_tokens=max_output_tokens,
+                    seed=None if seed is None or seed < 0 else int(seed),
+                    stream=True,
+                )
+                # Stream directly into the UI; st.write_stream supports OpenAI streams
+                response_text = st.write_stream(stream)
+
+            else:
+                # Recommended path: Responses API streaming (generator adapter)
+                # NOTE: The OpenAI SDK yields server-sent events; we adapt to a text generator for Streamlit.
+                def response_text_stream() -> Generator[str, None, None]:
+                    with client.responses.stream(
+                        model=model,
+                        input=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            *[{"role": m["role"], "content": m["content"]}
+                              for m in st.session_state.messages if m["role"] != "system"]
+                        ],
+                        temperature=temperature,
+                        max_output_tokens=max_output_tokens,
+                        seed=None if seed is None or seed < 0 else int(seed),
+                    ) as stream:
+                        # Iterate over incremental text deltas if available
+                        for event in stream:
+                            # Conservative parse: prefer generic text extractor when available
+                            if hasattr(event, "data"):
+                                # Some SDK versions provide event.data with {type, delta}
+                                delta = getattr(event, "delta", None) or getattr(event, "data", None)
+                                if isinstance(delta, dict):
+                                    chunk = (
+                                        delta.get("delta")
+                                        or delta.get("text")
+                                        or delta.get("output_text")
+                                    )
+                                    if isinstance(chunk, str) and chunk:
+                                        yield chunk
+                        # Ensure we flush the final text if provided by helper
+                        try:
+                            final = stream.get_final_response()
+                            if hasattr(final, "output_text") and final.output_text:
+                                yield final.output_text
+                        except Exception:
+                            pass
+
+                response_text = st.write_stream(response_text_stream())
+
+            # Store assistant message
+            st.session_state.messages.append({"role": "assistant", "content": response_text})
+
+            # Optional: collect quick feedback on the response
+            fb = st.feedback("thumbs", key=f"fb_{len(st.session_state.messages)}")
+            if fb is not None:
+                st.toast(f"Thanks for the feedback: {fb}")
+
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
+
+# -----------------------------
+# Footer
+# -----------------------------
+st.caption(
+    "Tip: Use the sidebar to switch between legacy Chat Completions and the newer Responses API, "
+    "adjust temperature/token limits, and trim the conversation length to control costs."
+)
