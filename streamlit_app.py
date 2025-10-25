@@ -52,6 +52,12 @@ with st.sidebar:
         ),
     )
 
+    # Auto-switch backend if model requires Responses API (e.g., gpt-4o, gpt-5)
+    family_needs_responses = model.startswith(("gpt-4o", "gpt-5"))
+    if backend == "Chat Completions (legacy)" and family_needs_responses:
+        st.warning("Selected model requires the Responses API; switched backend automatically.", icon="⚠️")
+        backend = "Responses (recommended)"
+
     temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
     max_output_tokens = st.slider("Max output tokens", 64, 4096, 512, 64)
     seed = st.number_input("Seed (optional, -1 for none)", value=-1, step=1)
@@ -99,6 +105,12 @@ def _as_openai_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return [{"role": h["role"], "content": h["content"]} for h in history]
 
 
+def token_kwarg(model_name: str, max_tokens_val: int) -> Dict[str, Any]:
+    """Return the correct max-token kwarg for the chosen model family."""
+    if model_name.startswith(("gpt-4o", "gpt-5")):
+        return {"max_completion_tokens": int(max_tokens_val)}
+    return {"max_tokens": int(max_tokens_val)}
+
 # -----------------------------
 # UI — Existing messages
 # -----------------------------
@@ -133,8 +145,8 @@ if prompt := st.chat_input("Ask me anything…"):
                     model=model,
                     messages=_as_openai_messages(st.session_state.messages),
                     temperature=temperature,
-                    max_tokens=max_output_tokens,
                     seed=None if seed is None or seed < 0 else int(seed),
+                    **token_kwarg(model, max_output_tokens),
                     stream=True,
                 )
                 # Stream directly into the UI; st.write_stream supports OpenAI streams
@@ -152,7 +164,7 @@ if prompt := st.chat_input("Ask me anything…"):
                               for m in st.session_state.messages if m["role"] != "system"]
                         ],
                         temperature=temperature,
-                        max_output_tokens=max_output_tokens,
+                        max_completion_tokens=max_output_tokens,
                         seed=None if seed is None or seed < 0 else int(seed),
                     ) as stream:
                         # Iterate over incremental text deltas if available
